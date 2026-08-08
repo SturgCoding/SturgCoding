@@ -1,10 +1,11 @@
 import datetime
-from dateutil import relativedelta
-import requests
-import os
-from lxml import etree
-import time
 import hashlib
+import os
+import time
+
+import requests
+from dateutil import relativedelta
+from lxml import etree
 
 # Fine-grained personal access token with All Repositories access:
 # Account permissions: read:Followers, read:Starring, read:Watching
@@ -20,7 +21,7 @@ def daily_readme(birthday):
     Returns the length of time since I was born
     e.g. 'XX years, XX months, XX days'
     """
-    diff = relativedelta.relativedelta(datetime.datetime.today(), birthday)
+    diff = relativedelta.relativedelta(datetime.datetime.today(), birthday)  # noqa: DTZ002
     return '{} {}, {} {}, {} {}{}'.format(
         diff.years, 'year' + format_plural(diff.years), 
         diff.months, 'month' + format_plural(diff.months), 
@@ -40,14 +41,21 @@ def format_plural(unit):
     return 's' if unit != 1 else ''
 
 
-def simple_request(func_name, query, variables):
+def simple_request(func_name, query, variables, retries=5):
     """
     Returns a request, or raises an Exception if the response does not succeed.
+    Transient failures (GitHub's undocumented secondary rate limit, returned as
+    403, or 502/503/504 gateway timeouts under load) are retried with
+    exponential backoff before giving up, instead of crashing the run outright.
     """
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
-    if request.status_code == 200:
-        return request
-    raise Exception(func_name, ' has failed with a', request.status_code, request.text, QUERY_COUNT)
+    for attempt in range(retries):
+        request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
+        if request.status_code == 200:
+            return request
+        if request.status_code in (403, 502, 503, 504) and attempt < retries - 1:
+            time.sleep(2 ** attempt * 2)
+            continue
+        raise Exception(func_name, ' has failed with a', request.status_code, request.text, QUERY_COUNT)  # noqa: TRY002
 
 
 def graph_commits(start_date, end_date):
@@ -106,7 +114,7 @@ def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del
             return stars_counter(request.json()['data']['user']['repositories']['edges'])
 
 
-def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None):
+def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None, retries=0):
     """
     Uses GitHub's GraphQL v4 API and cursor pagination to fetch 100 commits from a repository at a time
     """
@@ -149,10 +157,13 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
         if request.json()['data']['repository']['defaultBranchRef'] != None: # Only count commits if repo isn't empty
             return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits)
         else: return 0
+    if request.status_code in (403, 502, 503, 504) and retries < 4: # transient / secondary rate limit -- back off and retry instead of crashing the whole run
+        time.sleep(2 ** retries * 2)
+        return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, cursor, retries + 1)
     force_close_file(data, cache_comment) # saves what is currently in the file before this program crashes
     if request.status_code == 403:
-        raise Exception('Too many requests in a short amount of time!\nYou\'ve hit the non-documented anti-abuse limit!')
-    raise Exception('recursive_loc() has failed with a', request.status_code, request.text, QUERY_COUNT)
+        raise Exception('Too many requests in a short amount of time!\nYou\'ve hit the non-documented anti-abuse limit!')  # noqa: TRY002
+    raise Exception('recursive_loc() has failed with a', request.status_code, request.text, QUERY_COUNT)  # noqa: TRY002
 
 
 def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, addition_total, deletion_total, my_commits):
@@ -171,13 +182,15 @@ def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, additio
     else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'])
 
 
-def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=[]):
+def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=None):
     """
     Uses GitHub's GraphQL v4 API to query all the repositories I have access to (with respect to owner_affiliation)
     Queries 60 repos at a time, because larger queries give a 502 timeout error and smaller queries send too many
     requests and also give a 502 error.
     Returns the total number of lines of code in all repositories
     """
+    if edges is None:
+        edges = []
     query_count('loc_query')
     query = '''
     query ($owner_affiliation: [RepositoryAffiliation], $login: String!, $cursor: String) {
@@ -272,8 +285,7 @@ def flush_cache(edges, filename, comment_size):
             data = f.readlines()[:comment_size] # only save the comment
     with open(filename, 'w') as f:
         f.writelines(data)
-        for node in edges:
-            f.write(hashlib.sha256(node['node']['nameWithOwner'].encode('utf-8')).hexdigest() + ' 0 0 0 0\n')
+        f.writelines(hashlib.sha256(node['node']['nameWithOwner'].encode('utf-8')).hexdigest() + ' 0 0 0 0\n' for node in edges)
 
 
 def add_archive():
@@ -288,7 +300,7 @@ def add_archive():
     added_loc, deleted_loc, added_commits = 0, 0, 0
     contributed_repos = len(data)
     for line in data:
-        repo_hash, total_commits, my_commits, *loc = line.split()
+        _repo_hash, _total_commits, my_commits, *loc = line.split()
         added_loc += int(loc[0])
         deleted_loc += int(loc[1])
         if (my_commits.isdigit()): added_commits += int(my_commits)
@@ -338,7 +350,7 @@ def justify_format(root, element_id, new_text, length=0):
     Updates and formats the text of the element, and modifes the amount of dots in the previous element to justify the new text on the svg
     """
     if isinstance(new_text, int):
-        new_text = f"{'{:,}'.format(new_text)}"
+        new_text = f"{f'{new_text:,}'}"
     new_text = str(new_text)
     find_and_replace(root, element_id, new_text)
     just_len = max(0, length - len(new_text))
@@ -367,7 +379,7 @@ def commit_counter(comment_size):
     filename = 'cache/'+hashlib.sha256(USER_NAME.encode('utf-8')).hexdigest()+'.txt' # Use the same filename as cache_builder
     with open(filename, 'r') as f:
         data = f.readlines()
-    cache_comment = data[:comment_size] # save the comment block
+    data[:comment_size] # save the comment block
     data = data[comment_size:] # remove those lines
     for line in data:
         total_commits += int(line.split()[2])
@@ -411,7 +423,7 @@ def query_count(funct_id):
     """
     Counts how many times the GitHub GraphQL API is called
     """
-    global QUERY_COUNT
+    global QUERY_COUNT  # noqa: PLW0602
     QUERY_COUNT[funct_id] += 1
 
 
@@ -430,10 +442,10 @@ def formatter(query_type, difference, funct_return=False, whitespace=0):
     Prints a formatted time differential
     Returns formatted result if whitespace is specified, otherwise returns raw result
     """
-    print('{:<23}'.format('   ' + query_type + ':'), sep='', end='')
-    print('{:>12}'.format('%.4f' % difference + ' s ')) if difference > 1 else print('{:>12}'.format('%.4f' % (difference * 1000) + ' ms'))
+    print('{:<23}'.format('   ' + query_type + ':'), end='')
+    print('{:>12}'.format(f'{difference:.4f}' + ' s ')) if difference > 1 else print('{:>12}'.format('%.4f' % (difference * 1000) + ' ms'))
     if whitespace:
-        return f"{'{:,}'.format(funct_return): <{whitespace}}"
+        return f"{f'{funct_return:,}': <{whitespace}}"
     return funct_return
 
 
@@ -444,7 +456,7 @@ if __name__ == '__main__':
     user_data, user_time = perf_counter(user_getter, USER_NAME)
     OWNER_ID, acc_date = user_data
     formatter('account data', user_time)
-    age_data, age_time = perf_counter(daily_readme, datetime.datetime(2007, 1, 15))
+    age_data, age_time = perf_counter(daily_readme, datetime.datetime(2007, 1, 15))  # noqa: DTZ001
     formatter('age calculation', age_time)
     total_loc, loc_time = perf_counter(loc_query, ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'], 7)
     formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
@@ -454,7 +466,7 @@ if __name__ == '__main__':
     contrib_data, contrib_time = perf_counter(graph_repos_stars, 'repos', ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'])
     follower_data, follower_time = perf_counter(follower_getter, USER_NAME)
 
-    for index in range(len(total_loc)-1): total_loc[index] = '{:,}'.format(total_loc[index]) # format added, deleted, and total LOC
+    for index in range(len(total_loc)-1): total_loc[index] = f'{total_loc[index]:,}' # format added, deleted, and total LOC
 
     svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
     svg_overwrite('light_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
@@ -464,5 +476,5 @@ if __name__ == '__main__':
         '{:<21}'.format('Total function time:'), '{:>11}'.format('%.4f' % (user_time + age_time + loc_time + commit_time + star_time + repo_time + contrib_time)),
         ' s \033[E\033[E\033[E\033[E\033[E\033[E\033[E\033[E', sep='')
 
-    print('Total GitHub GraphQL API calls:', '{:>3}'.format(sum(QUERY_COUNT.values())))
+    print('Total GitHub GraphQL API calls:', f'{sum(QUERY_COUNT.values()):>3}')
     for funct_name, count in QUERY_COUNT.items(): print('{:<28}'.format('   ' + funct_name + ':'), '{:>6}'.format(count))
