@@ -291,20 +291,27 @@ def flush_cache(edges, filename, comment_size):
 def add_archive():
     """
     Several repositories I have contributed to have since been deleted.
-    This function adds them using their last known data
+    This function adds them using their last known data, stored in
+    cache/repository_archive.txt as one line per repo:
+    'repo_hash total_commits my_commits loc_added loc_deleted'
+    Any line that doesn't match that shape (the header/comment lines) is skipped,
+    so this is safe to call even when no repositories have been archived yet.
     """
-    with open('cache/repository_archive.txt', 'r') as f:
+    filename = 'cache/repository_archive.txt'
+    if not os.path.exists(filename):
+        return [0, 0, 0, 0, 0]
+    with open(filename, 'r') as f:
         data = f.readlines()
-    old_data = data
-    data = data[7:len(data)-3] # remove the comment block    
-    added_loc, deleted_loc, added_commits = 0, 0, 0
-    contributed_repos = len(data)
+    added_loc, deleted_loc, added_commits, contributed_repos = 0, 0, 0, 0
     for line in data:
-        _repo_hash, _total_commits, my_commits, *loc = line.split()
-        added_loc += int(loc[0])
-        deleted_loc += int(loc[1])
-        if (my_commits.isdigit()): added_commits += int(my_commits)
-    added_commits += int(old_data[-1].split()[4][:-1])
+        parts = line.split()
+        if len(parts) != 5 or not parts[2].isdigit(): # skip header/comment/diagram lines
+            continue
+        _repo_hash, _total_commits, my_commits, loc_added, loc_deleted = parts
+        contributed_repos += 1
+        added_commits += int(my_commits)
+        added_loc += int(loc_added)
+        deleted_loc += int(loc_deleted)
     return [added_loc, deleted_loc, added_loc - deleted_loc, added_commits, contributed_repos]
 
 def force_close_file(data, cache_comment):
@@ -466,6 +473,13 @@ if __name__ == '__main__':
     contrib_data, contrib_time = perf_counter(graph_repos_stars, 'repos', ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'])
     follower_data, follower_time = perf_counter(follower_getter, USER_NAME)
 
+    archive_data = add_archive() # fold in LOC/commits from repos I've contributed to that have since been deleted
+    total_loc[0] += archive_data[0]
+    total_loc[1] += archive_data[1]
+    total_loc[2] += archive_data[2]
+    commit_data += archive_data[3]
+    contrib_data += archive_data[4]
+
     for index in range(len(total_loc)-1): total_loc[index] = f'{total_loc[index]:,}' # format added, deleted, and total LOC
 
     svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
@@ -477,4 +491,4 @@ if __name__ == '__main__':
         ' s \033[E\033[E\033[E\033[E\033[E\033[E\033[E\033[E', sep='')
 
     print('Total GitHub GraphQL API calls:', f'{sum(QUERY_COUNT.values()):>3}')
-    for funct_name, count in QUERY_COUNT.items(): print('{:<28}'.format('   ' + funct_name + ':'), '{:>6}'.format(count))
+    for funct_name, count in QUERY_COUNT.items(): print('{:<28}'.format('   ' + funct_name + ':'), f'{count:>6}')
